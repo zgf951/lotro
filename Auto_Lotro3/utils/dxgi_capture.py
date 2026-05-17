@@ -18,6 +18,7 @@ import ctypes
 import ctypes.wintypes
 import win32gui
 import win32con
+import win32ui
 from pathlib import Path
 
 # 尝试导入 dxcam
@@ -34,16 +35,42 @@ except Exception as e:
 # Windows API
 user32 = ctypes.windll.user32
 
+# 启用 DPI 感知，解决 DPI 缩放问题
+try:
+    # 尝试设置进程的 DPI 感知
+    user32.SetProcessDPIAware()
+except:
+    pass
+
+# DPI 缩放辅助函数
+def get_dpi_scale():
+    """获取 DPI 缩放比例"""
+    try:
+        hdc = user32.GetDC(0)
+        dpi_x = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+        dpi_y = ctypes.windll.gdi32.GetDeviceCaps(hdc, 90)  # LOGPIXELSY
+        user32.ReleaseDC(0, hdc)
+        return dpi_x / 96.0, dpi_y / 96.0
+    except:
+        return 1.0, 1.0
+
+def adjust_for_dpi(x, y, w, h):
+    """根据 DPI 缩放调整坐标"""
+    scale_x, scale_y = get_dpi_scale()
+    return (int(x * scale_x), int(y * scale_y), 
+            int(w * scale_x), int(h * scale_y))
+
 
 class DxgiWindowCapture:
     """使用 DXGI 捕获窗口内容的类"""
     
-    def __init__(self, hwnd=None):
+    def __init__(self, hwnd=None, use_printwindow_fallback=True):
         """
         初始化 DXGI 捕获器
         
         Args:
             hwnd: 窗口句柄，如果为 None 则需要在 capture 前设置
+            use_printwindow_fallback: 是否使用 PrintWindow 作为备用方案
         """
         if not DXCAM_AVAILABLE:
             raise ImportError("dxcam 库未安装，请运行：pip install dxcam")
@@ -53,6 +80,8 @@ class DxgiWindowCapture:
         self._last_width = 0
         self._last_height = 0
         self._monitor_rect = None  # 显示器坐标 (left, top, right, bottom)
+        self._use_printwindow_fallback = use_printwindow_fallback
+        self._debug_mode = False  # 调试模式，会保存调试图像
         
         if hwnd:
             self._init_dxcam(hwnd)
@@ -83,13 +112,21 @@ class DxgiWindowCapture:
         
         # 初始化 dxcam，指定显示器区域
         # dxcam 会捕获整个显示器，我们需要从中裁剪出窗口区域
-        self._dxcam = dxcam.create(device_idx=0, max_buffer_len=1)
+        try:
+            self._dxcam = dxcam.create(device_idx=0, max_buffer_len=1)
+        except Exception as e:
+            print(f"[DXGI] dxcam.create 失败：{e}，将使用备用方案")
+            self._dxcam = None
         
         print(f"[DXGI] 初始化成功 - 窗口句柄：{hwnd}")
         print(f"[DXGI] 窗口屏幕位置：{self._window_screen_rect}")
         if self._client_screen_rect:
             print(f"[DXGI] 客户区屏幕位置：{self._client_screen_rect}")
         print(f"[DXGI] 客户区大小：{self._last_width}x{self._last_height}")
+        
+        # 获取 DPI 信息
+        scale_x, scale_y = get_dpi_scale()
+        print(f"[DXGI] DPI 缩放：x{scale_x:.2f}, y{scale_y:.2f}")
     
     @property
     def hwnd(self):
@@ -144,9 +181,24 @@ class DxgiWindowCapture:
             print("[DXGI 错误] 未设置窗口句柄")
             return None
 
-        if not self._dxcam:
-            self._init_dxcam(self._hwnd)
-
+        # 尝试使用 dxcam
+        if self._dxcam and DXCAM_AVAILABLE:
+            try:
+                result = self._capture_dxcam(x, y, w, h)
+                if result is not None:
+                    return result
+                print("[DXGI] dxcam 捕获失败，尝试备用方案")
+            except Exception as e:
+                print(f"[DXGI] dxcam 捕获异常：{e}")
+        
+        # 使用备用方案：PrintWindow
+        if self._use_printwindow_fallback:
+            return self._capture_printwindow(x, y, w, h)
+        
+        return None
+    
+    def _capture_dxcam(self, x=0, y=0, w=None, h=None):
+        """使用 dxcam 方式捕获"""
         # 每次调用都重新获取客户区屏幕坐标
         # 这样窗口移动后截图区域会自动跟随，不再捕捉到错误位置
         client_screen_rect = self._get_client_screen_rect()
@@ -214,10 +266,73 @@ class DxgiWindowCapture:
             elif len(crop.shape) == 3 and crop.shape[2] == 4:
                 crop = cv2.cvtColor(crop, cv2.COLOR_RGBA2BGR)
 
+            if self._debug_mode:
+                cv2.imwrite("debug_dxcam_capture.png", crop)
+                
             return crop
 
         except Exception as e:
             print(f"[DXGI 错误] 裁剪失败：{e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def _capture_printwindow(self, x=0, y=0, w=None, h=None):
+        """使用 PrintWindow API 捕获（备用方案）"""
+        hwnd = self._hwnd
+        
+        try:
+            # 获取客户区大小
+            client_rect = win32gui.GetClientRect(hwnd)
+            client_w = client_rect[2] - client_rect[0]
+            client_h = client_rect[3] - client_rect[1]
+            
+            if w is None:
+                w = client_w
+            if h is None:
+                h = client_h
+            
+            # 创建设备上下文
+            hwndDC = win32gui.GetWindowDC(hwnd)
+            mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+            saveDC = mfcDC.CreateCompatibleDC()
+            
+            # 创建位图
+            saveBitMap = win32ui.CreateBitmap()
+            saveBitMap.CreateCompatibleBitmap(mfcDC, client_w, client_h)
+            
+            saveDC.SelectObject(saveBitMap)
+            
+            # 使用 PrintWindow 捕获
+            result = ctypes.windll.user32.PrintWindow(hwnd, saveDC.GetSafeHdc(), 2)
+            
+            # 转换为 numpy 数组
+            bmpinfo = saveBitMap.GetInfo()
+            bmpstr = saveBitMap.GetBitmapBits(True)
+            
+            img = np.frombuffer(bmpstr, dtype=np.uint8)
+            img.shape = (bmpinfo['bmHeight'], bmpinfo['bmWidth'], 4)
+            
+            # 裁剪到指定区域
+            if x != 0 or y != 0 or w != client_w or h != client_h:
+                img = img[y:y+h, x:x+w]
+            
+            # 转换格式：BGRA -> BGR
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            # 释放资源
+            saveDC.DeleteDC()
+            mfcDC.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwndDC)
+            win32gui.DeleteObject(saveBitMap.GetHandle())
+            
+            if self._debug_mode:
+                cv2.imwrite("debug_printwindow_capture.png", img)
+            
+            return img
+            
+        except Exception as e:
+            print(f"[PrintWindow] 捕获失败：{e}")
             import traceback
             traceback.print_exc()
             return None
