@@ -110,65 +110,98 @@ def detect(frame):
                      fx=DETECT_SCALE, fy=DETECT_SCALE,
                      interpolation=cv2.INTER_NEAREST)
 
-    # ② HSV 提取
+    # ② HSV 提取（尝试多组参数提高鲁棒性）
     hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # 主参数（红/橙色）
     mask1 = cv2.inRange(hsv, HSV_LOWER1, HSV_UPPER1)
     mask2 = cv2.inRange(hsv, HSV_LOWER2, HSV_UPPER2)
     mask  = cv2.bitwise_or(mask1, mask2)
+    
+    # 备选参数（更宽容）
+    mask1_alt = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([20, 255, 255]))
+    mask2_alt = cv2.inRange(hsv, np.array([160, 80, 80]), np.array([180, 255, 255]))
+    mask_alt = cv2.bitwise_or(mask1_alt, mask2_alt)
 
     # ③ 形态学去噪
     kernel = np.ones((3, 3), np.uint8)
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask_alt = cv2.morphologyEx(mask_alt, cv2.MORPH_CLOSE, kernel)
 
     # ④ 找最大轮廓，重心必须在图像中心附近（排除边缘噪点）
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
+    best_cnt = None
+    best_mask = None
+    
+    # 尝试主掩码
     img_cx = img.shape[1] / 2.0
     img_cy = img.shape[0] / 2.0
     max_offset = min(img.shape[0], img.shape[1]) * 0.35
 
-    contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
-    cnt = None
-    for c in contours_sorted:
-        if cv2.contourArea(c) < 20:
-            break
-        M = cv2.moments(c)
-        if M["m00"] == 0:
+    for m in [mask, mask_alt]:
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL,
+                                      cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
             continue
-        ccx = M["m10"] / M["m00"]
-        ccy = M["m01"] / M["m00"]
-        if math.hypot(ccx - img_cx, ccy - img_cy) <= max_offset:
-            cnt = c
+
+        contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
+        for c in contours_sorted:
+            if cv2.contourArea(c) < 20:
+                break
+            M = cv2.moments(c)
+            if M["m00"] == 0:
+                continue
+            ccx = M["m10"] / M["m00"]
+            ccy = M["m01"] / M["m00"]
+            if math.hypot(ccx - img_cx, ccy - img_cy) <= max_offset:
+                best_cnt = c
+                best_mask = m
+                break
+        if best_cnt is not None:
             break
 
-    if cnt is None:
+    if best_cnt is None:
         return None
 
     # ⑤ 重心
-    M = cv2.moments(cnt)
+    M = cv2.moments(best_cnt)
     if M["m00"] == 0:
         return None
     cx = int(M["m10"] / M["m00"])
     cy = int(M["m01"] / M["m00"])
 
-    # ⑥ 箭尖 = approxPolyDP 简化多边形中内角最小的顶点
-    #
-    # 为什么不能用"最远点"：
-    #   LOTRO 三角形箭头的底边两个角 比 顶点更远离重心（等腰三角形几何性质），
-    #   "最远点"会找到底角，方向误差约 180°。
-    #   最小内角的顶点才是真正的尖端。
-    peri = cv2.arcLength(cnt, True)
-    approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-    # 至少需要 3 个顶点构成三角形；顶点太少时回退到原始轮廓
+    # ⑥ 箭尖 = 多种策略投票（提高鲁棒性）
+    candidates = []
+    
+    # 策略1: PCA 主方向（最可靠）
+    try:
+        pts_pca = best_cnt.reshape(-1, 2).astype(np.float32)
+        if len(pts_pca) >= 3:
+            mean, eigenvectors = cv2.PCACompute(pts_pca, mean=None)
+            main_dir = eigenvectors[0]
+            
+            projections = []
+            for pt in pts_pca:
+                proj = np.dot(pt - mean[0], main_dir)
+                projections.append((proj, tuple(pt)))
+            projections.sort()
+            
+            if len(projections) >= 2:
+                tip1 = projections[0][1]
+                tip2 = projections[-1][1]
+                dist1 = math.hypot(tip1[0]-cx, tip1[1]-cy)
+                dist2 = math.hypot(tip2[0]-cx, tip2[1]-cy)
+                candidates.append(tip1 if dist1 > dist2 else tip2)
+    except:
+        pass
+    
+    # 策略2: 最小内角（原始方法）
+    peri = cv2.arcLength(best_cnt, True)
+    approx = cv2.approxPolyDP(best_cnt, 0.06 * peri, True)  # 稍微增大 epsilon
     if approx is None or len(approx) < 3:
-        approx = cnt
-
+        approx = best_cnt
     pts = approx.reshape(-1, 2).astype(float)
-    n   = len(pts)
-    tip = (cx, cy)
+    n = len(pts)
+    tip_angle = (cx, cy)
     min_angle = float('inf')
     for i in range(n):
         p_prev = pts[(i - 1) % n]
@@ -183,7 +216,39 @@ def detect(frame):
         angle = math.acos(float(np.clip(cos_a, -1.0, 1.0)))
         if angle < min_angle:
             min_angle = angle
-            tip = (int(round(p_curr[0])), int(round(p_curr[1])))
+            tip_angle = (int(round(p_curr[0])), int(round(p_curr[1])))
+    candidates.append(tip_angle)
+    
+    # 策略3: 凸包上的最远点
+    try:
+        hull = cv2.convexHull(best_cnt)
+        max_dist = 0
+        tip_hull = (cx, cy)
+        for pt in hull:
+            pt_tuple = (int(pt[0][0]), int(pt[0][1]))
+            dist = math.hypot(pt_tuple[0]-cx, pt_tuple[1]-cy)
+            if dist > max_dist:
+                max_dist = dist
+                tip_hull = pt_tuple
+        candidates.append(tip_hull)
+    except:
+        pass
+    
+    # 投票选出最一致的结果
+    if not candidates:
+        tip = (cx, cy)
+    else:
+        # 简单投票：选择与其他候选点平均距离最近的
+        best_tip = candidates[0]
+        best_score = float('inf')
+        for c1 in candidates:
+            total_dist = 0.0
+            for c2 in candidates:
+                total_dist += math.hypot(c1[0]-c2[0], c1[1]-c2[1])
+            if total_dist < best_score:
+                best_score = total_dist
+                best_tip = c1
+        tip = best_tip
 
     # ⑦ 角度计算
     dx_raw   = tip[0] - cx
@@ -195,8 +260,8 @@ def detect(frame):
         "bearing":  bearing,
         "center":   (cx, cy),
         "tip":      tip,
-        "mask":     mask,
-        "contour":  cnt,
+        "mask":     best_mask,
+        "contour":  best_cnt,
         "img_up":   img,
     }
 
